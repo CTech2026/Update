@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
   Upgrade the system to W11 by first disabling sleep/hibernate timeouts to avoid mid-upgrade pauses,
-  then restoring the original power settings at the end. On success, deletes C:\ProgramData\W11.
-  NOW ALSO: Optionally runs Windows Update first (software + optional drivers).
+  ALWAYS running Windows Update first, then restoring original power settings at the end.
+  On success, deletes C:\ProgramData\W11.
 
 .NOTES
   - Requires Administrator.
@@ -16,22 +16,29 @@
 param(
   [string]$Source = "C:\ProgramData\W11\Win11_24H2.iso",
   [ValidateSet("Enable","Disable")]
-  [string]$DynamicUpdate = "Disable",
-
-  # New: control Windows Update behavior
-  [switch]$RunWindowsUpdate,          # If present, run Windows Update before OS setup
-  [switch]$IncludeDriverUpdates       # If present, include drivers in Windows Update
+  [string]$DynamicUpdate = "Disable"
 )
 
-# --- Power settings helpers ---
-function Get-PowerTimeouts {
-  $outSleep = powercfg /q SCHEME_CURRENT SUB_SLEEP STANDBYIDLE
-  $outHib   = powercfg /q SCHEME_CURRENT SUB_SLEEP HIBERNATEIDLE
+# -------- hard-coded behavior (no switches) ----------
+# Always run Windows Update first; include driver updates as well.
+$RUN_WINDOWS_UPDATE       = $true
+$INCLUDE_DRIVER_UPDATES   = $true   # set to $false if you want software-only updates
 
-  $acHexSleep = ($outSleep | Select-String 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)').Matches.Groups[1].Value
-  $dcHexSleep = ($outSleep | Select-String 'Current DC Power Setting Index:\s*0x([0-9a-fA-F]+)').Matches.Groups[1].Value
-  $acHexHib   = ($outHib   | Select-String 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)').Matches.Groups[1].Value
-  $dcHexHib   = ($outHib   | Select-String 'Current DC Power Setting Index:\s*0x([0-9a-fA-F]+)').Matches.Groups[1].Value
+# ------------------ helpers --------------------------
+
+function Try-Get {
+  param([scriptblock]$Do)
+  try { & $Do } catch { $null }
+}
+
+function Get-PowerTimeouts {
+  $outSleep = Try-Get { powercfg /q SCHEME_CURRENT SUB_SLEEP STANDBYIDLE }
+  $outHib   = Try-Get { powercfg /q SCHEME_CURRENT SUB_SLEEP HIBERNATEIDLE }
+
+  $acHexSleep = if ($outSleep) { ($outSleep | Select-String 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)').Matches.Groups[1].Value } else { $null }
+  $dcHexSleep = if ($outSleep) { ($outSleep | Select-String 'Current DC Power Setting Index:\s*0x([0-9a-fA-F]+)').Matches.Groups[1].Value } else { $null }
+  $acHexHib   = if ($outHib)   { ($outHib   | Select-String 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)').Matches.Groups[1].Value } else { $null }
+  $dcHexHib   = if ($outHib)   { ($outHib   | Select-String 'Current DC Power Setting Index:\s*0x([0-9a-fA-F]+)').Matches.Groups[1].Value } else { $null }
 
   [pscustomobject]@{
     StandbyTimeoutAC   = if ($acHexSleep) { [Convert]::ToInt32($acHexSleep,16) } else { $null }
@@ -48,23 +55,23 @@ function Set-PowerTimeouts {
     [Parameter(Mandatory)] [int]$HibernateTimeoutAC,
     [Parameter(Mandatory)] [int]$HibernateTimeoutDC
   )
-  Write-Host "Setting sleep/hibernate timeouts (AC=$StandbyTimeoutAC/DC=$StandbyTimeoutDC; HibAC=$HibernateTimeoutAC/HibDC=$HibernateTimeoutDC)..."
-  powercfg /Change standby-timeout-ac   $StandbyTimeoutAC   | Out-Null
-  powercfg /Change standby-timeout-dc   $StandbyTimeoutDC   | Out-Null
-  powercfg /Change hibernate-timeout-ac $HibernateTimeoutAC | Out-Null
-  powercfg /Change hibernate-timeout-dc $HibernateTimeoutDC | Out-Null
+  Write-Host "Setting sleep/hibernate timeouts AC/DC=$StandbyTimeoutAC/$StandbyTimeoutDC; Hib AC/DC=$HibernateTimeoutAC/$HibernateTimeoutDC"
+  Try-Get { powercfg /Change standby-timeout-ac   $StandbyTimeoutAC   | Out-Null } | Out-Null
+  Try-Get { powercfg /Change standby-timeout-dc   $StandbyTimeoutDC   | Out-Null } | Out-Null
+  Try-Get { powercfg /Change hibernate-timeout-ac $HibernateTimeoutAC | Out-Null } | Out-Null
+  Try-Get { powercfg /Change hibernate-timeout-dc $HibernateTimeoutDC | Out-Null } | Out-Null
 }
 
 function Set-NeverSleep {
-  Write-Host "Disabling sleep/hibernate timeouts for AC/DC (setting to Never = 0)..."
-  powercfg /Change standby-timeout-ac   0 | Out-Null
-  powercfg /Change standby-timeout-dc   0 | Out-Null
-  powercfg /Change hibernate-timeout-ac 0 | Out-Null
-  powercfg /Change hibernate-timeout-dc 0 | Out-Null
+  Write-Host "Disabling sleep/hibernate timeouts (setting to Never = 0)..."
+  Try-Get { powercfg /Change standby-timeout-ac   0 | Out-Null } | Out-Null
+  Try-Get { powercfg /Change standby-timeout-dc   0 | Out-Null } | Out-Null
+  Try-Get { powercfg /Change hibernate-timeout-ac 0 | Out-Null } | Out-Null
+  Try-Get { powercfg /Change hibernate-timeout-dc 0 | Out-Null } | Out-Null
   Write-Host "Sleep and hibernate timeouts set to Never."
 }
 
-# --- Windows Update (built-in COM API) ---
+# Windows Update using built-in COM API (PowerShell 5.1 compatible)
 function Invoke-WindowsUpdate {
   param(
     [switch]$IncludeDrivers,
@@ -72,17 +79,17 @@ function Invoke-WindowsUpdate {
   )
 
   Write-Host "Starting Windows Update search (IncludeDrivers=$($IncludeDrivers.IsPresent))..."
-  Add-Type -AssemblyName 'System.Runtime.InteropServices' | Out-Null
 
-  $session   = New-Object -ComObject Microsoft.Update.Session
-  $searcher  = $session.CreateUpdateSearcher()
+  $session  = New-Object -ComObject Microsoft.Update.Session
+  $searcher = $session.CreateUpdateSearcher()
 
   $criteria = "IsInstalled=0 and IsHidden=0"
   if (-not $IncludeDrivers) { $criteria += " and Type='Software'" }
 
   $sr = $searcher.Search($criteria)
   if ($sr.Updates.Count -eq 0) {
-    "[{0}] WU: No applicable updates found." -f (Get-Date -Format s) | Out-File -FilePath $LogFile -Encoding UTF8 -Append
+    ("[{0}] WU: No applicable updates found." -f (Get-Date -Format s)) |
+      Out-File -FilePath $LogFile -Encoding UTF8 -Append
     return [pscustomobject]@{ Installed=0; RebootRequired=$false; HResult=$sr.ResultCode }
   }
 
@@ -90,18 +97,20 @@ function Invoke-WindowsUpdate {
   $updates = New-Object -ComObject Microsoft.Update.UpdateColl
   $names = @()
   for ($i=0; $i -lt $sr.Updates.Count; $i++) {
-    [void]$updates.Add($sr.Updates.Item($i))
-    $names += $sr.Updates.Item($i).Title
+    $u = $sr.Updates.Item($i)
+    [void]$updates.Add($u)
+    $names += $u.Title
   }
 
-  "[{0}] WU: Found {1} update(s): {2}" -f (Get-Date -Format s), $updates.Count, ($names -join '; ') |
+  ("[{0}] WU: Found {1} update(s): {2}" -f (Get-Date -Format s), $updates.Count, ($names -join '; ')) |
     Out-File -FilePath $LogFile -Encoding UTF8 -Append
 
   # Download
   $downloader = $session.CreateUpdateDownloader()
   $downloader.Updates = $updates
   $dr = $downloader.Download()
-  "[{0}] WU: Download result = {1}" -f (Get-Date -Format s), $dr.ResultCode |
+
+  ("[{0}] WU: Download result = {1}" -f (Get-Date -Format s), $dr.ResultCode) |
     Out-File -FilePath $LogFile -Encoding UTF8 -Append
 
   # Filter to downloaded
@@ -111,17 +120,26 @@ function Invoke-WindowsUpdate {
   }
 
   if ($toInstall.Count -eq 0) {
-    "[{0}] WU: Nothing downloaded; skipping install." -f (Get-Date -Format s) | Out-File -FilePath $LogFile -Encoding UTF8 -Append
+    ("[{0}] WU: Nothing downloaded; skipping install." -f (Get-Date -Format s)) |
+      Out-File -FilePath $LogFile -Encoding UTF8 -Append
     return [pscustomobject]@{ Installed=0; RebootRequired=$false; HResult=$dr.ResultCode }
   }
 
+  # Install silently
   $installer = $session.CreateUpdateInstaller()
   $installer.ForceQuiet = $true
   $installer.Updates = $toInstall
-
   $ir = $installer.Install()
-  $installedCount = ($ir.ResultCode -eq 2) ? $ir.Updates.Count : ($ir.Updates.Count)  # 2 = Succeeded
-  "[{0}] WU: Install result = {1}; RebootRequired={2}; InstalledCount={3}" -f (Get-Date -Format s), $ir.ResultCode, $ir.RebootRequired, $installedCount |
+
+  # Count succeeded (2) or succeeded with errors (3)
+  $installedCount = 0
+  for ($i = 0; $i -lt $toInstall.Count; $i++) {
+    $ur = $ir.GetUpdateResult($i)
+    if ($ur.ResultCode -eq 2 -or $ur.ResultCode -eq 3) { $installedCount++ }
+  }
+
+  ("[{0}] WU: Install result = {1}; RebootRequired={2}; InstalledCount={3}" -f `
+    (Get-Date -Format s), $ir.ResultCode, $ir.RebootRequired, $installedCount) |
     Out-File -FilePath $LogFile -Encoding UTF8 -Append
 
   return [pscustomobject]@{
@@ -184,7 +202,26 @@ function Start-Upgrade {
   return $p.ExitCode
 }
 
-# ---- main ----
+function Get-ExitMessage {
+  param([int]$Code)
+  $map = @{
+    0          = 'Success'
+    1          = 'Restart required to continue'
+    3          = 'General error'
+    4          = 'Compatibility blocks (hard)'
+    5          = 'Download/DU failure'
+    302        = 'Cancelled'
+    3010       = 'Success with reboot required (WU)'
+    0xC1900101 = 'Driver rollback (C1900101)'
+    0xC1900208 = 'Incompatible app detected'
+    0xC1900204 = 'Unsupported OS edition/target'
+    0x8007001F = 'Device/driver error during upgrade'
+  }
+  if ($map.ContainsKey($Code)) { $map[$Code] } else { 'Unknown' }
+}
+
+# --------------------- main ---------------------------
+
 $prevTimeouts = $null
 $src = $null
 $exit = $null
@@ -193,86 +230,81 @@ $statusPath = Join-Path -Path $env:SystemDrive -ChildPath "Win11SetupLogs\status
 New-Item -Path (Split-Path $statusPath) -ItemType Directory -Force | Out-Null
 
 try {
-  # Capture current power timeouts, then set to Never
+  # Capture and disable power timeouts
   try {
     $prevTimeouts = Get-PowerTimeouts
-    Write-Host ("Captured current timeouts: Sleep AC/DC = {0}/{1} min, Hibernate AC/DC = {2}/{3} min" -f `
+    Write-Host ("Captured timeouts: Sleep AC/DC={0}/{1}  Hib AC/DC={2}/{3}" -f `
       $prevTimeouts.StandbyTimeoutAC, $prevTimeouts.StandbyTimeoutDC, $prevTimeouts.HibernateTimeoutAC, $prevTimeouts.HibernateTimeoutDC)
   } catch {
     Write-Warning "Could not capture existing power timeouts: $($_.Exception.Message)"
   }
 
-  try { Set-NeverSleep } catch { Write-Warning "Failed to set NeverSleep: $($_.Exception.Message)" }
+  Try-Get { Set-NeverSleep } | Out-Null
 
-  # (NEW) Run Windows Update first, if requested
+  # ALWAYS: Windows Update first
   $wuRebootNeeded = $false
-  if ($RunWindowsUpdate.IsPresent) {
-    "[{0}] WU: Starting pre-upgrade updates (IncludeDrivers={1})" -f (Get-Date -Format s), $IncludeDriverUpdates.IsPresent |
+  if ($RUN_WINDOWS_UPDATE) {
+    ("[{0}] WU: Starting pre-upgrade updates (IncludeDrivers={1})" -f (Get-Date -Format s), $INCLUDE_DRIVER_UPDATES) |
       Out-File -FilePath $statusPath -Encoding UTF8 -Append
 
     try {
-      $wu = Invoke-WindowsUpdate -IncludeDrivers:$IncludeDriverUpdates.IsPresent -LogFile $statusPath
-      if ($wu.RebootRequired) {
+      $wu = Invoke-WindowsUpdate -IncludeDrivers:($INCLUDE_DRIVER_UPDATES) -LogFile $statusPath
+      if ($wu -and $wu.RebootRequired) {
         $wuRebootNeeded = $true
-        "[{0}] WU: Reboot required before OS upgrade. Aborting upgrade step." -f (Get-Date -Format s) |
+        ("[{0}] WU: Reboot required before OS upgrade. Aborting upgrade step." -f (Get-Date -Format s)) |
           Out-File -FilePath $statusPath -Encoding UTF8 -Append
       }
     } catch {
-      "[{0}] WU: ERROR {1}" -f (Get-Date -Format s), $_.Exception.Message |
+      ("[{0}] WU: ERROR {1}" -f (Get-Date -Format s), $_.Exception.Message) |
         Out-File -FilePath $statusPath -Encoding UTF8 -Append
     }
   }
 
   if ($wuRebootNeeded) {
-    $exit = 3010  # Standard "success with reboot required"
-    $global:LASTEXITCODE = $exit
-    Write-Output "Windows Update requires a reboot (ExitCode 3010). Reboot, then run this script again to continue the OS upgrade."
-  }
-  else {
-    # Resolve source & run upgrade
-    $src  = Resolve-SetupSource -Source $Source
-    $exit = Start-Upgrade -SetupExe $src.Setup -DynamicUpdate $DynamicUpdate
-
-    # Record status; do NOT close the console or reboot
-    "[{0}] ExitCode={1} (DynamicUpdate={2})" -f (Get-Date -Format s), $exit, $DynamicUpdate |
+    $exit = 3010
+    $msg  = Get-ExitMessage -Code $exit
+    ("[{0}] ExitCode={1} ({2}) DynamicUpdate={3}" -f (Get-Date -Format s), $exit, $msg, $DynamicUpdate) |
       Out-File -FilePath $statusPath -Encoding UTF8 -Append
-
     $global:LASTEXITCODE = $exit
-    Write-Output "Setup ExitCode=$exit (DynamicUpdate=$DynamicUpdate). Reboot later to continue upgrade."
+    Write-Output "Windows Update requires a reboot (ExitCode $exit - $msg). Reboot, then run this script again to proceed with the OS upgrade."
+    return
   }
+
+  # Resolve source & run upgrade
+  $src  = Resolve-SetupSource -Source $Source
+  $exit = Start-Upgrade -SetupExe $src.Setup -DynamicUpdate $DynamicUpdate
+
+  $msg = Get-ExitMessage -Code $exit
+  ("[{0}] ExitCode={1} ({2}) DynamicUpdate={3}" -f (Get-Date -Format s), $exit, $msg, $DynamicUpdate) |
+    Out-File -FilePath $statusPath -Encoding UTF8 -Append
+
+  $global:LASTEXITCODE = $exit
+  Write-Output "Setup ExitCode=$exit ($msg). DynamicUpdate=$DynamicUpdate. Reboot later to continue."
 }
 finally {
-  # Always dismount the ISO if we mounted it
-  try {
-    if ($src -and $src.Mount) { Dismount-DiskImage -ImagePath $Source | Out-Null }
-  } catch {
-    Write-Warning "Failed to dismount ISO: $($_.Exception.Message)"
-  }
+  # Dismount ISO if mounted
+  Try-Get { if ($src -and $src.Mount) { Dismount-DiskImage -ImagePath $Source | Out-Null } } | Out-Null
 
-  # Restore prior power timeouts if we captured them
-  try {
+  # Restore prior power timeouts if captured (fallbacks to 0 if any nulls)
+  Try-Get {
     if ($prevTimeouts -and $prevTimeouts.StandbyTimeoutAC -ne $null) {
-      Set-PowerTimeouts `
-        -StandbyTimeoutAC   $prevTimeouts.StandbyTimeoutAC `
-        -StandbyTimeoutDC   $prevTimeouts.StandbyTimeoutDC `
-        -HibernateTimeoutAC $prevTimeouts.HibernateTimeoutAC `
-        -HibernateTimeoutDC $prevTimeouts.HibernateTimeoutDC
+      $sbAC  = if ($prevTimeouts.StandbyTimeoutAC   -ne $null) { [int]$prevTimeouts.StandbyTimeoutAC   } else { 0 }
+      $sbDC  = if ($prevTimeouts.StandbyTimeoutDC   -ne $null) { [int]$prevTimeouts.StandbyTimeoutDC   } else { 0 }
+      $hibAC = if ($prevTimeouts.HibernateTimeoutAC -ne $null) { [int]$prevTimeouts.HibernateTimeoutAC } else { 0 }
+      $hibDC = if ($prevTimeouts.HibernateTimeoutDC -ne $null) { [int]$prevTimeouts.HibernateTimeoutDC } else { 0 }
+      Set-PowerTimeouts -StandbyTimeoutAC $sbAC -StandbyTimeoutDC $sbDC -HibernateTimeoutAC $hibAC -HibernateTimeoutDC $hibDC
       Write-Host "Restored previous power timeouts."
     } else {
-      Write-Warning "Previous power timeouts unknown; leaving current settings in place."
+      Write-Warning "Previous power timeouts unknown; leaving current settings."
     }
-  } catch {
-    Write-Warning "Failed to restore power timeouts: $($_.Exception.Message)"
-  }
+  } | Out-Null
 
   # If setup succeeded (ExitCode 0), remove the W11 folder
-  try {
+  Try-Get {
     if ($exit -eq 0 -and (Test-Path -LiteralPath $w11Folder)) {
-      Write-Host "Upgrade reported success (ExitCode 0). Removing $w11Folder ..."
-      Remove-Item -LiteralPath $w11Folder -Recurse -Force -ErrorAction Stop
+      Write-Host "Upgrade reported success. Removing $w11Folder ..."
+      Remove-Item -LiteralPath $w11Folder -Recurse -Force
       Write-Host "Removed $w11Folder."
     }
-  } catch {
-    Write-Warning "Failed to remove w11 Folder: $($_.Exception.Message)"
-  }
+  } | Out-Null
 }
